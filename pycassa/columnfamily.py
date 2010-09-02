@@ -321,22 +321,7 @@ class ColumnFamily(object):
         -------
         int timestamp
         """
-        timestamp = self.timestamp()
-
-        cols = []
-        for c, v in columns.iteritems():
-            if self.super:
-                subc = [Column(name=subname, value=subvalue, timestamp=timestamp) \
-                        for subname, subvalue in v.iteritems()]
-                column = SuperColumn(name=c, columns=subc)
-                cols.append(Mutation(column_or_supercolumn=ColumnOrSuperColumn(super_column=column)))
-            else:
-                column = Column(name=c, value=v, timestamp=timestamp)
-                cols.append(Mutation(column_or_supercolumn=ColumnOrSuperColumn(column=column)))
-        self.client.batch_mutate(self.keyspace,
-                                 {key: {self.column_family: cols}},
-                                 self._wcl(write_consistency_level))
-        return timestamp
+        return self.insert_remove(key, insert_columns=columns, write_consistency_level=write_consistency_level)
 
     def remove(self, key, columns=None, super_column=None, write_consistency_level = None):
         """
@@ -358,18 +343,67 @@ class ColumnFamily(object):
         -------
         int timestamp
         """
-        timestamp = self.timestamp()
-        if columns is not None:
-            # Deletion doesn't support SliceRange predicates as of Cassandra 0.6.0,
-            # so we can't add column_start, column_finish, etc... yet
-            sp = SlicePredicate(column_names=columns)
-            deletion = Deletion(timestamp=timestamp, super_column=super_column, predicate=sp)
-            mutation = Mutation(deletion=deletion)
-            self.client.batch_mutate(self.keyspace,
-                                     {key: {self.column_family: [mutation]}},
-                                     self._wcl(write_consistency_level))
-        else:
+        if columns is None:
+            timestamp = self.timestamp()
             cp = ColumnPath(column_family=self.column_family, super_column=super_column)
             self.client.remove(self.keyspace, key, cp, timestamp,
                                self._wcl(write_consistency_level))
+            return timestamp
+        else:
+            if super_column is None:
+                remove_columns = columns
+            else:
+                remove_columns = {super_column: columns}
+            return self.insert_remove(key, remove_columns=remove_columns, write_consistency_level=write_consistency_level)
+
+    def insert_remove(self, key, insert_columns={}, remove_columns={}, write_consistency_level = None):
+        """
+        Insert, update or delete columns for a key
+
+        Parameters
+        ----------
+        key : str
+            The key to insert or update the columns at
+        insert_columns : dict
+            Column: {'column': 'value'}
+            SuperColumn: {'column': {'subcolumn': 'value'}}
+            The columns or supercolumns to insert or update
+        remove_columns : list or dict
+            Column: ['column']
+            SuperColumn: {'column': ['subcolumn']}
+            The columns or supercolumns to delete
+        write_consistency_level : ConsistencyLevel
+            Affects the guaranteed replication factor before returning from
+            any write operation
+
+        Returns
+        -------
+        int timestamp
+        """
+        timestamp = self.timestamp()
+        mutations = []
+
+        for c, v in insert_columns.iteritems():
+            if self.super:
+                subc = [Column(name=subname, value=subvalue, timestamp=timestamp) \
+                        for subname, subvalue in v.iteritems()]
+                column = SuperColumn(name=c, columns=subc)
+                mutations.append(Mutation(column_or_supercolumn=ColumnOrSuperColumn(super_column=column)))
+            else:
+                column = Column(name=c, value=v, timestamp=timestamp)
+                mutations.append(Mutation(column_or_supercolumn=ColumnOrSuperColumn(column=column)))
+
+        if self.super:
+            for c, v in remove_columns.iteritems():
+                sp = SlicePredicate(column_names=v)
+                deletion = Deletion(timestamp=timestamp, super_column=c, predicate=sp)
+                mutations.append(Mutation(deletion=deletion))
+        elif remove_columns:
+            sp = SlicePredicate(column_names=remove_columns)
+            deletion = Deletion(timestamp=timestamp, predicate=sp)
+            mutations.append(Mutation(deletion=deletion))
+
+        self.client.batch_mutate(self.keyspace,
+                                 {key: {self.column_family: mutations}},
+                                 self._wcl(write_consistency_level))
         return timestamp
