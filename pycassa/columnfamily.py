@@ -6,6 +6,7 @@ except ImportError:
 from cassandra.ttypes import Column, ColumnOrSuperColumn, ColumnParent, \
     ColumnPath, ConsistencyLevel, NotFoundException, SlicePredicate, \
     SliceRange, SuperColumn, Mutation, Deletion
+from connection import NoServerAvailable
 
 import time
 
@@ -232,7 +233,8 @@ class ColumnFamily(object):
     def get_range(self, start="", finish="", columns=None, column_start="",
                   column_finish="", column_reversed=False, column_count=100,
                   row_count=None, include_timestamp=False,
-                  super_column=None, read_consistency_level = None):
+                  super_column=None, read_consistency_level=None,
+                  retry_count=0, retry_delay=1, log=None):
         """
         Get an iterator over keys in a specified range
         
@@ -278,13 +280,30 @@ class ColumnFamily(object):
         buffer_size = self.buffer_size
         if row_count is not None:
             buffer_size = min(row_count, self.buffer_size)
+
+        loop_retry_count = retry_count
+
         while True:
-            key_slices = self.client.get_range_slice(self.keyspace, cp, sp, last_key,
-                                                     finish, buffer_size,
-                                                     self._rcl(read_consistency_level))
+            try:
+                key_slices = self.client.get_range_slice(self.keyspace, cp, sp, last_key,
+                                                         finish, buffer_size,
+                                                         self._rcl(read_consistency_level))
+            except NoServerAvailable:
+                if loop_retry_count > 0:
+                    loop_retry_count -= 1
+                    if log:
+                        log.warning("pycassa: sleeping and retrying get_range_slice")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise
+
+            loop_retry_count = retry_count
+
             # This may happen if nothing was ever inserted
             if key_slices is None:
                 return
+
             for j, key_slice in enumerate(key_slices):
                 # Ignore the first element after the first iteration
                 # because it will be a duplicate.
@@ -298,6 +317,7 @@ class ColumnFamily(object):
 
             if len(key_slices) != self.buffer_size:
                 return
+
             last_key = key_slices[-1].key
             i += 1
 
